@@ -81,6 +81,12 @@ module type Hol_kernel =
       val INST : (term * term) list -> thm -> thm
       val axioms : unit -> thm list
       val new_axiom : term -> thm
+      val reflect_function : thm -> (term -> term) -> unit
+      val reflect_pred : thm -> (term -> term) -> unit
+      val function_reflections : unit -> thm list
+      val predicate_reflections : unit -> thm list
+      val FUNCTION_REFLECT : term -> thm
+      val PROOF_REFLECT : thm -> thm
       val definitions : unit -> thm list
       val new_basic_definition : term -> thm
       val new_basic_type_definition :
@@ -637,6 +643,138 @@ module Hol : Hol_kernel = struct
     Sequent([],safe_mk_eq (Comb(abs,mk_comb(rep,a))) a),
     Sequent([],safe_mk_eq (Comb(P,r))
                           (safe_mk_eq (mk_comb(rep,mk_comb(abs,r))) r))
+
+  (* Trusted executable interpretations, registered against theorem evidence.
+     Registration trusts correspondence with the theory, just as new_axiom
+     trusts a logical assertion; checking the evidence's shape is not a proof
+     of the supplied OCaml implementation. No embedding is hardcoded here. *)
+  let dest_reflection_application application =
+    let rec collect arguments = function
+      | Comb(function_term,argument) -> collect (argument::arguments) function_term
+      | head -> head,arguments in
+    collect [] application
+
+  let rec reflection_equation_clauses = function
+    | Comb(Const("!",_),Abs(_,body)) -> reflection_equation_clauses body
+    | Comb(Comb(Const("/\\",_),left),right) ->
+        reflection_equation_clauses left @ reflection_equation_clauses right
+    | clause -> [clause]
+
+  (* Constant identity includes its full HOL type; registration is not a
+     name-only lookup or an implicit match of polymorphic instances. *)
+  let same_reflection_constant left right = alphaorder left right = 0
+
+  let reflection_signature_from_evidence (Sequent(assumptions,conclusion)) =
+    if assumptions <> [] then
+      failwith "reflection registration: evidence has assumptions";
+    let equation_signature clause =
+      let left_hand_side,_ = dest_eq clause in
+      let constant,arguments = dest_reflection_application left_hand_side in
+      if not(is_const constant) then
+        failwith "reflection registration: expected a constant on the left";
+      constant,length arguments in
+    let signatures = map equation_signature (reflection_equation_clauses conclusion) in
+    let constant,arity = hd signatures in
+    if not(forall (fun (other_constant,other_arity) ->
+      same_reflection_constant constant other_constant && arity = other_arity)
+      signatures) then
+      failwith "reflection registration: inconsistent defining equations";
+    constant,arity
+
+  type function_reflection_registration = {
+    function_constant : term;
+    function_arity : int;
+    function_evidence : thm;
+    function_evaluator : term -> term
+  }
+
+  type predicate_reflection_registration = {
+    predicate_constant : term;
+    predicate_evidence : thm;
+    predicate_unquoter : term -> term
+  }
+
+  let function_reflection_registry : function_reflection_registration list ref = ref []
+  let predicate_reflection_registry : predicate_reflection_registration list ref = ref []
+
+  let function_reflections() =
+    map (fun registration -> registration.function_evidence)
+        (!function_reflection_registry)
+
+  let predicate_reflections() =
+    map (fun registration -> registration.predicate_evidence)
+        (!predicate_reflection_registry)
+
+  (* Registration installs the executable handler alongside its interface and
+     evidence. Existing registrations cannot be replaced. *)
+  let reflect_function evidence evaluator =
+    let constant,arity = reflection_signature_from_evidence evidence in
+    if exists (fun registration ->
+      same_reflection_constant constant registration.function_constant)
+      (!function_reflection_registry) then
+      failwith "reflect_function: constant already registered";
+    let registration = {
+      function_constant = constant;
+      function_arity = arity;
+      function_evidence = evidence;
+      function_evaluator = evaluator
+    } in
+    function_reflection_registry := registration::(!function_reflection_registry)
+
+  let reflect_pred evidence unquoter =
+    let constant,arity = reflection_signature_from_evidence evidence in
+    (match type_of constant with
+     | Tyapp("fun",[_;result_type]) when result_type = bool_ty && arity = 1 -> ()
+     | _ -> failwith "reflect_pred: expected a unary predicate equation");
+    if exists (fun registration ->
+      same_reflection_constant constant registration.predicate_constant)
+      (!predicate_reflection_registry) then
+      failwith "reflect_pred: predicate already registered";
+    let registration = {
+      predicate_constant = constant;
+      predicate_evidence = evidence;
+      predicate_unquoter = unquoter
+    } in
+    predicate_reflection_registry := registration::(!predicate_reflection_registry)
+
+  let lookup_function_reflection constant =
+    try find (fun registration ->
+      same_reflection_constant constant registration.function_constant)
+      (!function_reflection_registry)
+    with Failure _ -> failwith "FUNCTION_REFLECT: unregistered function"
+
+  let lookup_predicate_reflection constant =
+    try find (fun registration ->
+      same_reflection_constant constant registration.predicate_constant)
+      (!predicate_reflection_registry)
+    with Failure _ -> failwith "PROOF_REFLECT: unregistered predicate"
+
+  (* Resolve the application head, invoke its registered evaluator, then
+     return |- application = result after checking the result's interface. *)
+  let FUNCTION_REFLECT application =
+    if frees application <> [] then
+      failwith "FUNCTION_REFLECT: expected a closed application";
+    let constant,arguments = dest_reflection_application application in
+    let registration = lookup_function_reflection constant in
+    if length arguments <> registration.function_arity then
+      failwith "FUNCTION_REFLECT: wrong application arity";
+    let result = registration.function_evaluator application in
+    if type_of result <> type_of application || frees result <> [] then
+      failwith "FUNCTION_REFLECT: expected a closed result of the same type";
+    Sequent([],safe_mk_eq application result)
+
+  (* Resolve the conclusion's predicate, invoke its registered unquoter on
+     the argument, then return the proposition with the same assumptions. *)
+  let PROOF_REFLECT (Sequent(assumptions,conclusion)) =
+    let constant,arguments = dest_reflection_application conclusion in
+    let registration = lookup_predicate_reflection constant in
+    let predicate_argument = match arguments with
+      | [argument] -> argument
+      | _ -> failwith "PROOF_REFLECT: expected a unary predicate application" in
+    let proposition = registration.predicate_unquoter predicate_argument in
+    if type_of proposition <> bool_ty then
+      failwith "PROOF_REFLECT: expected a proposition";
+    Sequent(assumptions,proposition)
 
 end;;
 
